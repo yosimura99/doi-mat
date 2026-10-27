@@ -71,8 +71,28 @@ export function toPixels(result, w, h) {
   return (result.faceLandmarks || []).map(face => face.map(p => ({ x: p.x * w, y: p.y * h, z: p.z * w })));
 }
 
-export async function detectImage(canvas, onStatus) {
+function boxOf(f) { let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9; for (const p of f) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); } return { x0, y0, x1, y1, cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, s: Math.max(x1 - x0, y1 - y0) }; }
+
+/**
+ * Nhận diện trên toàn ảnh, rồi chạy lại trên vùng cắt độ phân giải cao quanh từng mặt
+ * (mặt nhỏ trong ảnh lớn → landmark chính xác hơn nhiều).
+ */
+export async function detectImage(canvas, onStatus, { refine = true, maxRefine = 4 } = {}) {
   const lm = await getLandmarker('IMAGE', onStatus);
-  const res = lm.detect(canvas);
-  return toPixels(res, canvas.width, canvas.height);
+  const faces = toPixels(lm.detect(canvas), canvas.width, canvas.height);
+  if (!refine || !faces.length) return faces;
+  const R = 640, cc = document.createElement('canvas'); cc.width = cc.height = R;
+  const ctx = cc.getContext('2d', { willReadFrequently: false });
+  const order = faces.map((f, i) => [boxOf(f).s, i]).sort((a, b) => b[0] - a[0]).slice(0, maxRefine).map(v => v[1]);
+  for (const i of order) {
+    const b = boxOf(faces[i]); const side = b.s * 2.0, ox = b.cx - side / 2, oy = b.cy - side / 2;
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, R, R); ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(canvas, ox, oy, side, side, 0, 0, R, R);
+    let res; try { res = lm.detect(cc); } catch (_) { continue; }
+    const cand = (res.faceLandmarks || []).map(f => f.map(p => ({ x: ox + p.x * side, y: oy + p.y * side, z: p.z * side })));
+    let best = null, bd = 1e9;
+    for (const f of cand) { const q = boxOf(f); const d = Math.hypot(q.cx - b.cx, q.cy - b.cy) / b.s + Math.abs(Math.log(q.s / b.s)); if (d < bd) { bd = d; best = f; } }
+    if (best && bd < 0.35) faces[i] = best;
+  }
+  return faces;
 }

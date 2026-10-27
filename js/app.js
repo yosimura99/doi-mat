@@ -4,7 +4,7 @@ import { FaceSwapper, DEFAULTS } from './faceswap.js';
 import { pickFace, bbox, IDX } from './geometry.js';
 
 const $ = s => document.querySelector(s);
-const MAX_SIDE = 2048;
+const MAX_SIDE = 4096, MAX_PIX = 16e6;
 const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
 /* ---------- tiện ích ---------- */
@@ -15,7 +15,7 @@ async function fileToCanvas(file) {
   const url = URL.createObjectURL(file);
   try {
     const img = new Image(); img.decoding = 'async'; img.src = url; await img.decode();
-    const w0 = img.naturalWidth, h0 = img.naturalHeight, k = Math.min(1, MAX_SIDE / Math.max(w0, h0));
+    const w0 = img.naturalWidth, h0 = img.naturalHeight, k = Math.min(1, MAX_SIDE / Math.max(w0, h0), Math.sqrt(MAX_PIX / (w0 * h0)));
     const c = document.createElement('canvas'); c.width = Math.round(w0 * k); c.height = Math.round(h0 * k);
     const ctx = c.getContext('2d'); ctx.imageSmoothingQuality = 'high'; ctx.drawImage(img, 0, 0, c.width, c.height);
     return c;
@@ -152,8 +152,8 @@ document.querySelectorAll('.rtab').forEach(b => b.onclick = () => showResult(+b.
 function swapOnce(src, dst, opts) {
   const fs = getSwapper();
   fs.setSource(src.img, src.faces[src.sel], src.img.width, src.img.height);
-  fs.render(dst.img, dst.img.width, dst.img.height, dst.faces[dst.sel], opts);
-  return { before: dst.img, after: cloneCanvas(fs.canvas) };
+  const r = fs.render(dst.img, dst.img.width, dst.img.height, dst.faces[dst.sel], opts) || {};
+  return { before: dst.img, after: cloneCanvas(fs.canvas), yaw: [r.yawSrc || 0, r.yawDst || 0] };
 }
 
 $('#go').onclick = async () => {
@@ -165,7 +165,9 @@ $('#go').onclick = async () => {
     if ($('#both').checked) { await nextFrame(); results.push(swapOnce(slots.B, slots.A, opts)); }
     $('#rtabs').hidden = results.length < 2;
     $('#result').hidden = false; showResult(0); setSplit(50);
-    setStatus($('#status'), `Xong trong ${((performance.now() - t0) / 1000).toFixed(1)} giây ✓`);
+    const [ya, yb] = results[0].yaw, tilted = Math.abs(ya - yb) > 15 || Math.max(Math.abs(ya), Math.abs(yb)) > 30;
+    setStatus($('#status'), `Xong trong ${((performance.now() - t0) / 1000).toFixed(1)} giây ✓` +
+      (tilted ? ' · Mẹo: ảnh chụp thẳng mặt và cùng góc nghiêng sẽ cho kết quả đẹp hơn.' : ''));
     $('#result').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) { console.error(e); setStatus($('#status'), 'Lỗi khi ghép mặt: ' + (e.message || e), true); }
   finally { updateGo(); }

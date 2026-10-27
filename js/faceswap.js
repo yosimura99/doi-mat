@@ -1,14 +1,14 @@
 // Bộ ghép mặt WebGL2: warp tam giác Delaunay → chuyển ánh sáng tần số thấp → khớp màu LAB (vùng da)
 // → khớp độ nét/hạt → trộn đa băng tần (Laplacian pyramid) với mặt nạ bao lồi đã co + làm mờ viền.
-import { IDX, N, triangles, horn, vertexVisibility, mirrorWeights, innerWeights, MIRROR, openness, bbox } from './geometry.js';
+import { IDX, N, triangles, horn, vertexVisibility, mirrorWeights, innerWeights, MIRROR, openness, bbox, smooth, yawOf } from './geometry.js';
 
 const VS_QUAD = `#version 300 es
 in vec2 a_q; uniform float u_flip; out vec2 v_uv;
 void main(){ v_uv=a_q; gl_Position=vec4(a_q.x*2.-1., u_flip>0.5 ? 1.-2.*a_q.y : 2.*a_q.y-1., 0., 1.); }`;
 
 const VS_WARP = `#version 300 es
-in vec3 a_pos; in vec2 a_uv; in vec2 a_uvm; in float a_w;
-out vec2 v_uv; out vec2 v_uvm; out float v_w;
+in vec3 a_pos; in vec2 a_uv; in vec2 a_uvm; in vec2 a_w;
+out vec2 v_uv; out vec2 v_uvm; out vec2 v_w;
 void main(){ v_uv=a_uv; v_uvm=a_uvm; v_w=a_w; gl_Position=vec4(a_pos.x*2.-1., a_pos.y*2.-1., a_pos.z, 1.); }`;
 
 const H = `#version 300 es
@@ -31,8 +31,9 @@ float luma(vec3 c){ return dot(c, vec3(0.299,0.587,0.114)); }
 
 const FS = {
   warp: `#version 300 es
-precision highp float; in vec2 v_uv; in vec2 v_uvm; in float v_w; uniform sampler2D u_src; out vec4 o;
-void main(){ vec3 a=texture(u_src,v_uv).rgb, b=texture(u_src,v_uvm).rgb; o=vec4(mix(a,b,clamp(v_w,0.,1.)),1.); }`,
+precision highp float; in vec2 v_uv; in vec2 v_uvm; in vec2 v_w; uniform sampler2D u_src; out vec4 o;
+// alpha = độ tin cậy của mặt nguồn tại đỉnh (tam giác bị quay khuất ở cả hai nửa → để da ảnh đích)
+void main(){ vec3 a=texture(u_src,v_uv).rgb, b=texture(u_src,v_uvm).rgb; o=vec4(mix(a,b,clamp(v_w.x,0.,1.)),clamp(v_w.y,0.,1.)); }`,
   crop: H + `uniform sampler2D u_t; uniform vec4 u_crop; void main(){ o=vec4(texture(u_t, u_crop.xy + v_uv*u_crop.zw).rgb,1.); }`,
   copy: H + `uniform sampler2D u_t; void main(){ o=texture(u_t, v_uv); }`,
   blur: H + `uniform sampler2D u_t; uniform vec2 u_dir; uniform float u_sigma;
@@ -40,43 +41,87 @@ void main(){ vec4 s=vec4(0.); float ws=0.; int r=int(min(ceil(u_sigma*2.5),40.))
   for(int i=-40;i<=40;i++){ if(i<-r||i>r) continue; float fi=float(i); float w=exp(-fi*fi/(2.*u_sigma*u_sigma)); s+=texture(u_t,v_uv+u_dir*fi)*w; ws+=w; }
   o=s/ws; }`,
   // Che khuất (tóc mái, tay…) ở vùng trán/thái dương: pixel khác xa màu da → giữ ảnh đích
-  occ: H + LAB + `uniform sampler2D u_w; uniform sampler2D u_d; uniform sampler2D u_z; uniform vec3 u_sm; uniform vec3 u_ss; uniform vec3 u_dm; uniform vec3 u_ds; uniform vec2 u_ec; uniform vec2 u_up;
-void main(){ vec4 w=texture(u_w,v_uv); vec3 d=texture(u_d,v_uv).rgb;
-  vec3 qs=(rgb2lab(w.rgb)-u_sm)/u_ss, qd=(rgb2lab(d)-u_dm)/u_ds; vec3 k=vec3(0.45,1.,1.);
-  float d2s=dot(qs*qs,k), d2d=dot(qd*qd,k);
+  occ: H + LAB + `uniform sampler2D u_w; uniform sampler2D u_d; uniform sampler2D u_z; uniform vec3 u_sm; uniform vec3 u_ss; uniform vec3 u_dm; uniform vec3 u_ds; uniform vec2 u_ec; uniform vec2 u_up; uniform sampler2D u_sl; uniform sampler2D u_wm; uniform sampler2D u_slm;
+void main(){ vec4 w=texture(u_w,v_uv); vec3 d=texture(u_d,v_uv).rgb; vec4 sl=texture(u_sl,v_uv); vec4 wm=texture(u_wm,v_uv); vec4 slm=texture(u_slm,v_uv);
+  vec3 qs=(rgb2lab(w.rgb)-u_sm)/u_ss, qd=(rgb2lab(d)-u_dm)/u_ds; vec3 k=vec3(0.35,1.,1.);
+  // bóng đổ trên da thì đậm màu hơn (a,b tăng), tóc thì nhạt màu → lệch dương của a,b bị phạt nhẹ
+  vec3 qs2=vec3(qs.x, qs.y>0.?qs.y*0.4:qs.y, qs.z>0.?qs.z*0.4:qs.z);
+  float d2s=dot(qs2*qs2,k), d2d=dot(qd*qd,k);
   float t=dot(v_uv-u_ec,u_up); float zone=max(smoothstep(0.05,0.28,t), texture(u_z,v_uv).r);
-  o=vec4(smoothstep(6.,16.,d2s)*zone*w.a, smoothstep(9.,24.,d2d)*zone, 0., 1.); }`,
-  mcomb: H + `uniform sampler2D u_m; uniform sampler2D u_o; uniform float u_amt;
-void main(){ vec4 m=texture(u_m,v_uv); vec2 c=texture(u_o,v_uv).rg; float k=1.-clamp(max(c.x,c.y)*1.6,0.,1.)*u_amt; o=vec4(m.r*k, m.g*(1.-c.x), m.b*(1.-c.y), 1.); }`,
+  float strand=0.; if(sl.a>0.003){ vec3 lr=rgb2lab(sl.rgb/sl.a), lw=rgb2lab(w.rgb); strand=smoothstep(5.,11.,lr.x-lw.x)*smoothstep(0.95,0.75,length(lw.yz)/max(length(lr.yz),1.)); }
+  float zs=max(zone, texture(u_z,v_uv).r);
+  vec3 qm=(rgb2lab(wm.rgb)-u_sm)/u_ss; float d2m=dot(qm*qm,k);
+  float strandM=0.; if(slm.a>0.003){ strandM=smoothstep(7.,15.,rgb2lab(slm.rgb/slm.a).x-rgb2lab(wm.rgb).x); }
+  float mok=(1.-smoothstep(9.,20.,d2m))*(1.-strandM)*smoothstep(0.12,0.45,wm.a);
+  o=vec4(max(smoothstep(6.,14.,d2s)*zone, strand*zs)*w.a, smoothstep(9.,24.,d2d)*zone, mok, 1.); }`,
+  // da cục bộ của nguồn (chuẩn hoá theo trọng số "giống da") → tham chiếu phát hiện sợi tóc và để vá
+  sprep: H + LAB + `uniform sampler2D u_w; uniform sampler2D u_m; uniform vec3 u_sm; uniform vec3 u_ss;
+void main(){ vec4 w=texture(u_w,v_uv); vec4 m=texture(u_m,v_uv); vec3 q=(rgb2lab(w.rgb)-u_sm)/u_ss;
+  float d2=dot(q*q,vec3(0.35,1.,1.)); float dark=max(0.,-q.x);
+  float ws=m.r*w.a*(1.-smoothstep(3.,8.,d2))*(1.-smoothstep(1.2,2.4,dark)); o=vec4(w.rgb*ws, ws); }`,
+  // vá chỗ tóc/vật che trên mặt nguồn bằng da cục bộ của chính mặt nguồn
+  // ưu tiên nửa mặt đối xứng (đã cân độ sáng cục bộ); sợi tóc mảnh → da cục bộ; còn lại → để ảnh đích (mcomb)
+  inpaint: H + `uniform sampler2D u_w; uniform sampler2D u_s; uniform sampler2D u_o; uniform sampler2D u_wm; uniform sampler2D u_sm2; uniform float u_hasM;
+void main(){ vec4 w=texture(u_w,v_uv); vec4 s=texture(u_s,v_uv); vec3 oc=texture(u_o,v_uv).rgb; float k=oc.r;
+  vec3 col=w.rgb;
+  float ks=k*smoothstep(0.01,0.06,s.a); vec3 ref = s.a>1e-3 ? s.rgb/s.a : w.rgb;
+  if(u_hasM>0.5){ vec4 m=texture(u_wm,v_uv); vec4 sm=texture(u_sm2,v_uv);
+    vec3 refm = sm.a>1e-3 ? sm.rgb/sm.a : m.rgb;
+    vec3 g = s.a>0.02 ? clamp(ref/max(refm,vec3(0.02)), vec3(0.6), vec3(1.6)) : vec3(1.);
+    float km=k*oc.b; col=mix(col, ref, ks*(1.-oc.b)); col=mix(col, clamp(m.rgb*g,0.,1.), km); }
+  else col=mix(col, ref, ks);
+  o=vec4(col, w.a); }`,
+  mcomb: H + `uniform sampler2D u_m; uniform sampler2D u_o; uniform sampler2D u_o2; uniform float u_amt; uniform float u_big;
+void main(){ vec4 m=texture(u_m,v_uv); vec2 c=texture(u_o,v_uv).rg; vec3 cc=texture(u_o,v_uv).rgb; vec3 c2=texture(u_o2,v_uv).rgb;
+  // nới rộng vùng tóc che của nguồn (bắt cả sợi tóc mảnh sát mảng tóc)
+  cc.x=max(cc.x, smoothstep(0.1,0.4,c2.x)*(1.-c2.z)); float k=1.-clamp(max(cc.y, cc.x*(1.-cc.z)*u_big)*1.6,0.,1.)*u_amt; o=vec4(m.r*k, m.g*(1.-c.x), m.b*(1.-c.y), 1.); }`,
   // Ước lượng ánh sáng (chuẩn hoá theo vùng da, loại điểm khác màu da): (Yđ·wđ, wđ, Yn·wn, wn)
   illumPrep: H + LAB + `uniform sampler2D u_d; uniform sampler2D u_w; uniform sampler2D u_m; uniform vec3 u_sm; uniform vec3 u_ss; uniform vec3 u_dm; uniform vec3 u_ds;
 void main(){ vec4 w=texture(u_w,v_uv); vec3 d=texture(u_d,v_uv).rgb; vec4 m=texture(u_m,v_uv);
-  vec3 qs=(rgb2lab(w.rgb)-u_sm)/u_ss, qd=(rgb2lab(d)-u_dm)/u_ds; vec3 k=vec3(0.3,1.,1.);
-  float ws=m.g*w.a*(1.-smoothstep(6.,18.,dot(qs*qs,k))), wd=m.b*(1.-smoothstep(6.,18.,dot(qd*qd,k)));
-  o=vec4(luma(d)*wd, wd, luma(w.rgb)*ws, ws); }`,
+  vec3 qs=(rgb2lab(w.rgb)-u_sm)/u_ss, qd=(rgb2lab(d)-u_dm)/u_ds;
+  // nguồn: KHÔNG loại vùng tối theo L (đó chính là bóng cần khử), chỉ loại theo sắc độ (tóc, nền)
+  float ws=m.g*w.a*(1.-smoothstep(6.,18.,dot(qs*qs,vec3(0.04,1.,1.)))), wd=m.b*(1.-smoothstep(6.,18.,dot(qd*qd,vec3(0.15,1.,1.))));
+  o=vec4(rgb2lab(d).x*0.01*wd, wd, rgb2lab(w.rgb).x*0.01*ws, ws); }`,
   // Thay bóng/ánh sáng tần số thấp của nguồn bằng của ảnh đích
-  relight: H + LAB + `uniform sampler2D u_w; uniform sampler2D u_i; uniform float u_strength; uniform float u_g;
+  // trong không gian LAB: bỏ bóng tần số thấp của nguồn (L và cả độ "ấm" đi kèm theo độ dốc a,b~L), thêm bóng của ảnh đích
+  relight: H + LAB + `uniform sampler2D u_w; uniform sampler2D u_i; uniform float u_strength; uniform vec3 u_sm; uniform vec3 u_dm; uniform vec2 u_ks; uniform vec2 u_kt; uniform float u_lim;
 void main(){ vec4 w=texture(u_w,v_uv); vec4 i=texture(u_i,v_uv);
-  float ok=smoothstep(0.02,0.2,min(i.y,i.w));
-  float r=((i.x+1e-4)/(i.y+1e-4))/((i.z+1e-4)/(i.w+1e-4))/u_g;
-  r = clamp(mix(1., r, u_strength*ok), 0.5, 2.0);
-  o=vec4(clamp(w.rgb*r,0.,1.), w.a); }`,
+  float ok=smoothstep(0.02,0.2,min(i.y,i.w))*u_strength;
+  float Lt=100.*(i.x+1e-5)/(i.y+1e-5), Ls=100.*(i.z+1e-5)/(i.w+1e-5);
+  float ds=clamp(Ls-u_sm.x,-u_lim,u_lim)*ok, dt=clamp(Lt-u_dm.x,-u_lim,u_lim)*ok;
+  vec3 l=rgb2lab(w.rgb);
+  // bóng tối thì nhân mạnh hơn (tỉ lệ theo L), vùng sáng cộng gần như tuyến tính
+  float g=clamp(l.x/max(Ls,5.),0.5,1.6);
+  float L0=l.x; l.x=max(0.,l.x+(dt-ds)*g);
+  l.yz=l.yz*pow(clamp(l.x/max(L0,1.),0.3,1.15),0.6)+clamp((u_kt*dt-u_ks*ds)*g, vec2(-10.), vec2(10.));
+  o=vec4(clamp(lab2rgb(l),0.,1.), w.a); }`,
   statsPack: H + `uniform sampler2D u_t; uniform sampler2D u_m; uniform float u_useA; uniform float u_ch;
 void main(){ vec4 c=texture(u_t,v_uv); vec4 mm=texture(u_m,v_uv); float m=u_ch>1.5?mm.b:mm.g; o=vec4(c.rgb, m*mix(1.,c.a,u_useA)); }`,
-  labXfer: H + LAB + `uniform sampler2D u_w; uniform vec3 u_ms; uniform vec3 u_ss; uniform vec3 u_mt; uniform vec3 u_st; uniform float u_amt;
-void main(){ vec4 w=texture(u_w,v_uv); vec3 l=rgb2lab(w.rgb); vec3 r=clamp(u_st/max(u_ss,vec3(1e-3)), vec3(0.6), vec3(1.6));
-  vec3 t=(l-u_ms)*r+u_mt; o=vec4(lab2rgb(mix(l,t,u_amt)), w.a); }`,
+  labXfer: H + LAB + `uniform sampler2D u_w; uniform vec3 u_ms; uniform vec3 u_ss; uniform vec3 u_mt; uniform vec3 u_st; uniform float u_amt; uniform vec2 u_ks; uniform vec2 u_kt;
+void main(){ vec4 w=texture(u_w,v_uv); vec3 l=rgb2lab(w.rgb); vec3 r=clamp(u_st/max(u_ss,vec3(1e-3)), vec3(0.7,0.6,0.6), vec3(1.4,1.3,1.3));
+  float tl=(l.x-u_ms.x)*r.x+u_mt.x;
+  // a,b: bỏ phần phụ thuộc độ sáng của nguồn, khớp phần dư, rồi cộng lại phụ thuộc độ sáng của ảnh đích
+  vec2 res=(l.yz-u_ms.yz-u_ks*(l.x-u_ms.x))*r.yz;
+  vec3 t=vec3(tl, u_mt.yz+res+u_kt*(tl-u_mt.x));
+  // không để phép chuyển màu da đẩy điểm ít màu (tròng mắt, lòng trắng) sang xanh lạnh
+  t.yz=max(t.yz, min(l.yz, vec2(1.5))); o=vec4(lab2rgb(mix(l,t,u_amt)), w.a); }`,
   measure: H + LAB + `uniform sampler2D u_a; uniform sampler2D u_d; uniform sampler2D u_m;
 void main(){ vec4 a=texture(u_a,v_uv); o=vec4(luma(a.rgb), luma(texture(u_d,v_uv).rgb), texture(u_m,v_uv).g*a.a, 1.); }`,
   // Khớp độ nét + hạt nhiễu, rồi đặt lên ảnh đích theo vùng phủ của warp
   finalA: H + LAB + `uniform sampler2D u_c; uniform sampler2D u_d; uniform vec2 u_px; uniform float u_sharp; uniform float u_noise; uniform float u_seed;
+uniform sampler2D u_o; uniform sampler2D u_o2; uniform sampler2D u_mz; uniform float u_fill;
 float hash(vec2 p){ p=fract(p*vec2(443.897,441.423)+u_seed); p+=dot(p,p.yx+19.19); return fract((p.x+p.y)*p.x); }
 void main(){ vec4 c=texture(u_c,v_uv); vec3 d=texture(u_d,v_uv).rgb;
   vec3 b=vec3(0.); for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++){ float w=(x==0?2.:1.)*(y==0?2.:1.); b+=texture(u_c,v_uv+u_px*vec2(x,y)).rgb*w; } b/=16.;
   vec3 col = c.rgb + (c.rgb-b)*u_sharp;            // u_sharp<0 làm mờ, >0 làm nét
   vec2 q=v_uv/u_px; float n=(hash(q)+hash(q+17.3)+hash(q+41.7)-1.5)*2.;
   col += n*u_noise;
-  o=vec4(mix(d, clamp(col,0.,1.), c.a), 1.); }`,
+  // chỗ tóc che trên mặt nguồn (không vá được từ nửa đối xứng) → dùng thẳng da ảnh đích (không trộn mờ)
+  vec3 oc=texture(u_o,v_uv).rgb, o2=texture(u_o2,v_uv).rgb;
+  float hole=max(smoothstep(0.03,0.3,oc.r), smoothstep(0.04,0.22,o2.r))*u_fill;
+  float tsk=texture(u_mz,v_uv).r;
+  float a=c.a*(1.-clamp(hole*1.5,0.,1.)*tsk);
+  o=vec4(mix(d, clamp(col,0.,1.), a), 1.); }`,
   down: H + `uniform sampler2D u_t; uniform vec2 u_px; // texel của ảnh lớn hơn
 void main(){ o=0.25*(texture(u_t,v_uv+u_px*vec2(-1.,-1.))+texture(u_t,v_uv+u_px*vec2(1.,-1.))+texture(u_t,v_uv+u_px*vec2(-1.,1.))+texture(u_t,v_uv+u_px*vec2(1.,1.))); }`,
   collapse: H + `uniform sampler2D u_a0; uniform sampler2D u_a1; uniform sampler2D u_b0; uniform sampler2D u_b1; uniform sampler2D u_m; uniform sampler2D u_r1; uniform float u_top;
@@ -85,6 +130,9 @@ void main(){ float m=texture(u_m,v_uv).r; vec3 a0=texture(u_a0,v_uv).rgb, b0=tex
   vec3 la=a0-texture(u_a1,v_uv).rgb, lb=b0-texture(u_b1,v_uv).rgb;
   o=vec4(clamp(mix(lb,la,m)+texture(u_r1,v_uv).rgb,0.,1.),1.); }`,
   feather: H + `uniform sampler2D u_a; uniform sampler2D u_d; uniform sampler2D u_m; void main(){ float m=texture(u_m,v_uv).r; o=vec4(mix(texture(u_d,v_uv).rgb, texture(u_a,v_uv).rgb, m),1.); }`,
+  // lõi mặt: chỉ dùng mặt nguồn đã chỉnh (không trộn tần số thấp của ảnh đích → không bóng ma)
+  core: H + `uniform sampler2D u_r; uniform sampler2D u_a; uniform sampler2D u_m;
+void main(){ float m=texture(u_m,v_uv).r; float k=smoothstep(0.88,0.995,m); o=vec4(mix(texture(u_r,v_uv).rgb, texture(u_a,v_uv).rgb, k),1.); }`,
   output: H + `uniform sampler2D u_d; uniform sampler2D u_r; uniform vec4 u_crop; uniform float u_has;
 void main(){ vec3 c=texture(u_d,v_uv).rgb; if(u_has>0.5){ vec2 q=(v_uv-u_crop.xy)/u_crop.zw; if(q.x>=0.&&q.y>=0.&&q.x<=1.&&q.y<=1.) c=texture(u_r,q).rgb; } o=vec4(c,1.); }`,
 };
@@ -114,7 +162,12 @@ function labStats(px, thresh = 0.5) {
     if (W < 6) break;
     mean = s.map(v => v / W); std = s2.map((v, k) => Math.max(0.8, Math.sqrt(Math.max(0, v / W - mean[k]*mean[k])))); n = W;
   }
-  return { mean, std, n };
+  // độ dốc a,b theo L (vùng tối của da thường "ấm"/đậm màu hơn) – hồi quy có trọng số trên tập đã lọc
+  let cl = 0, ca = 0, cb = 0, Wt = 0;
+  for (let j = 0; j < L.length; j++) { const l = L[j]; let d2 = 0; for (let k = 0; k < 3; k++) d2 += ((l[k] - mean[k]) / std[k]) ** 2 * (k ? 1 : 0.5); if (d2 > 7.5) continue;
+    const dl = l[0] - mean[0]; cl += M[j] * dl * dl; ca += M[j] * dl * (l[1] - mean[1]); cb += M[j] * dl * (l[2] - mean[2]); Wt += M[j]; }
+  const slope = cl > 1e-3 ? [0, Math.max(-0.6, Math.min(0.6, ca / cl)), Math.max(-0.6, Math.min(0.6, cb / cl))] : [0, 0, 0];
+  return { mean, std, n, slope };
 }
 
 export const DEFAULTS = {
@@ -145,7 +198,7 @@ export class FaceSwapper {
     this.warpBuf = gl.createBuffer(); this.warpVAO = this._warpVAO();
     this.srcTex = this._tex(); this.dstTex = this._tex();
     this.maskCanvas = document.createElement('canvas');
-    this.mR = document.createElement('canvas'); this.mG = document.createElement('canvas'); this.mB = document.createElement('canvas'); this.mZ = document.createElement('canvas');
+    this.mR = document.createElement('canvas'); this.mG = document.createElement('canvas'); this.mB = document.createElement('canvas'); this.mZ = document.createElement('canvas'); this.mT = document.createElement('canvas');
     this.frame = 0; this.stats = null; this.grainP = null;
     this.tris = triangles();
   }
@@ -175,11 +228,11 @@ export class FaceSwapper {
   _warpVAO() {
     const gl = this.gl, vao = gl.createVertexArray(); gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.warpBuf);
-    const st = 8 * 4;
+    const st = 9 * 4;
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, st, 0);
     gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, st, 12);
     gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 2, gl.FLOAT, false, st, 20);
-    gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 1, gl.FLOAT, false, st, 28);
+    gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 2, gl.FLOAT, false, st, 28);
     gl.bindVertexArray(null); return vao;
   }
   _tex() {
@@ -239,6 +292,14 @@ export class FaceSwapper {
     this.src = { lm, w, h };
     this.srcVis = vertexVisibility(lm);
     this.srcMirror = mirrorWeights(this.srcVis);
+    // độ tin cậy từng đỉnh: nhìn thấy rõ (trực tiếp hoặc qua nửa đối xứng) → 1; quay khuất → 0
+    const raw = new Float32Array(N), mir = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const v = this.srcVis[i], vm = this.srcVis[MIRROR[i]], w = this.srcMirror[i];
+      raw[i] = smooth(0.04, 0.3, v); mir[i] = smooth(0.04, 0.3, v * (1 - w) + vm * w);
+    }
+    this.srcQ = { raw, mir };
+    this.srcYaw = yawOf(lm);
     this.stats = null; this.frame = 0;
   }
 
@@ -289,6 +350,9 @@ export class FaceSwapper {
     r.fillStyle = '#000'; r.fillRect(0, 0, mw, mh);
     r.fillStyle = '#f00'; path(r, hull); r.fill();
     r.strokeStyle = '#000'; r.lineJoin = 'round'; r.lineWidth = 2 * 0.03 * fw; path(r, hull); r.stroke();
+    // luôn phủ kín lông mày của ảnh đích (tránh "hai cặp lông mày")
+    r.fillStyle = '#f00'; r.strokeStyle = '#f00'; r.lineCap = 'round'; r.lineWidth = 0.07 * fw;
+    for (const idx of [IDX.leftBrow, IDX.rightBrow]) { path(r, idx.map(D)); r.fill(); r.stroke(); }
     skin(this.mG.getContext('2d'), P, '#0f0');
     skin(this.mB.getContext('2d'), D, '#00f');
     // giữ miệng (răng) / mắt nhắm của ảnh đích
@@ -301,10 +365,33 @@ export class FaceSwapper {
     }
     // vùng được phép phát hiện che khuất: cả mặt trừ ngũ quan (nới rộng)
     { const z = this.mZ; z.width = mw; z.height = mh; const c = z.getContext('2d');
-      c.fillStyle = '#000'; c.fillRect(0, 0, mw, mh); c.fillStyle = '#fff'; path(c, hull); c.fill();
+      c.fillStyle = '#000'; c.fillRect(0, 0, mw, mh); c.fillStyle = '#f00'; path(c, hull); c.fill();
       c.fillStyle = '#000'; c.strokeStyle = '#000'; c.lineJoin = 'round'; c.lineWidth = 0.12 * fw;
-      for (const idx of [IDX.leftEye, IDX.rightEye, IDX.lipsOuter, IDX.leftBrow, IDX.rightBrow]) { path(c, idx.map(P)); c.fill(); c.stroke(); }
-      for (const i of [98, 327, 4]) { const p = P(i); c.beginPath(); c.arc(p[0], p[1], 0.08 * fw, 0, 7); c.fill(); } }
+      for (const F of [P, D]) { c.lineWidth = 0.12 * fw;
+        for (const idx of [IDX.leftEye, IDX.rightEye, IDX.lipsOuter, IDX.leftBrow, IDX.rightBrow]) { path(c, idx.map(F)); c.fill(); c.stroke(); }
+        for (const i of [98, 327, 4]) { const p = F(i); c.beginPath(); c.arc(p[0], p[1], 0.08 * fw, 0, 7); c.fill(); }
+      }
+      // vùng an toàn để lấp bằng da ảnh đích: tránh xa ngũ quan của cả hai ảnh
+      { const t = this.mT; t.width = mw; t.height = mh; const tc = t.getContext('2d');
+        tc.fillStyle = '#000'; tc.fillRect(0, 0, mw, mh); tc.fillStyle = '#f00'; path(tc, hull); tc.fill();
+        tc.fillStyle = '#000'; tc.strokeStyle = '#000'; tc.lineJoin = 'round';
+        for (const F of [P, D]) {
+          tc.lineWidth = 0.24 * fw; for (const idx of [IDX.leftEye, IDX.rightEye, IDX.leftBrow, IDX.rightBrow]) { path(tc, idx.map(F)); tc.fill(); tc.stroke(); }
+          tc.lineWidth = 0.12 * fw; path(tc, IDX.lipsOuter.map(F)); tc.fill(); tc.stroke();
+          for (const i of [98, 327, 4]) { const q = F(i); tc.beginPath(); tc.arc(q[0], q[1], 0.08 * fw, 0, 7); tc.fill(); }
+        } }
+      // lõi da để đo thống kê màu (thu nhỏ về giữa mặt → ít tóc/nền lẫn vào): G = nguồn, B = đích
+      c.globalCompositeOperation = 'lighter';
+      for (const [F, col] of [[P, '#0f0'], [D, '#00f']]) {
+        const ctr = F(1), hh = hullOf(F).map(p => [ctr[0] + (p[0] - ctr[0]) * 0.72, ctr[1] + (p[1] - ctr[1]) * 0.72]);
+        const t = document.createElement('canvas'); t.width = mw; t.height = mh; const tc = t.getContext('2d');
+        tc.fillStyle = col; path(tc, hh); tc.fill();
+        tc.globalCompositeOperation = 'destination-out'; tc.fillStyle = '#000'; tc.strokeStyle = '#000'; tc.lineJoin = 'round'; tc.lineCap = 'round'; tc.lineWidth = 0.08 * fw;
+        for (const idx of [IDX.leftEye, IDX.rightEye, IDX.lipsOuter, IDX.leftBrow, IDX.rightBrow]) { path(tc, idx.map(F)); tc.fill(); tc.stroke(); }
+        for (const i of [98, 327]) { const p = F(i); tc.beginPath(); tc.arc(p[0], p[1], 0.06 * fw, 0, 7); tc.fill(); }
+        c.drawImage(t, 0, 0);
+      }
+      c.globalCompositeOperation = 'source-over'; }
     const m = this.maskCanvas; m.width = mw; m.height = mh;
     const mc = m.getContext('2d'); mc.globalCompositeOperation = 'source-over'; mc.drawImage(this.mR, 0, 0);
     mc.globalCompositeOperation = 'lighter'; mc.drawImage(this.mG, 0, 0); mc.drawImage(this.mB, 0, 0); mc.globalCompositeOperation = 'source-over';
@@ -342,21 +429,33 @@ export class FaceSwapper {
     const T = this.tris, sw = this.src.w, sh = this.src.h, slm = this.src.lm;
     let zmin = Infinity, zmax = -Infinity; for (let i = 0; i < N; i++) { zmin = Math.min(zmin, pts[i].z); zmax = Math.max(zmax, pts[i].z); }
     const zr = Math.max(1e-3, zmax - zmin);
-    const data = new Float32Array(T.length * 8);
+    const data = new Float32Array(T.length * 9), Q = this.srcQ;
     for (let k = 0; k < T.length; k++) {
-      const i = T[k], p = pts[i], s = slm[i], m = slm[MIRROR[i]], o = k * 8;
+      const i = T[k], p = pts[i], s = slm[i], m = slm[MIRROR[i]], o = k * 9;
       data[o] = (p.x - crop.x) / crop.w; data[o+1] = (p.y - crop.y) / crop.h; data[o+2] = ((p.z - zmin) / zr) * 1.8 - 0.9;
       data[o+3] = s.x / sw; data[o+4] = s.y / sh; data[o+5] = m.x / sw; data[o+6] = m.y / sh;
       data[o+7] = opts.mirror ? this.srcMirror[i] : 0;
+      data[o+8] = opts.pose === false ? 1 : (opts.mirror ? Q.mir[i] : Q.raw[i]);
     }
-    const W = this._fbo('warp', pw, ph, true);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, W.fb); gl.viewport(0, 0, pw, ph);
-    gl.clearColor(0, 0, 0, 0); gl.clearDepth(1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
-    gl.useProgram(this.progs.warp.p); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.srcTex); gl.uniform1i(this.progs.warp.u.u_src, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.warpBuf); gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
-    gl.bindVertexArray(this.warpVAO); gl.drawArrays(gl.TRIANGLES, 0, T.length); gl.bindVertexArray(null);
-    gl.disable(gl.DEPTH_TEST);
+    const drawWarp = (name, d) => {
+      const F = this._fbo(name, pw, ph, true);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, F.fb); gl.viewport(0, 0, pw, ph);
+      gl.clearColor(0, 0, 0, 0); gl.clearDepth(1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+      gl.useProgram(this.progs.warp.p); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.srcTex); gl.uniform1i(this.progs.warp.u.u_src, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.warpBuf); gl.bufferData(gl.ARRAY_BUFFER, d, gl.DYNAMIC_DRAW);
+      gl.bindVertexArray(this.warpVAO); gl.drawArrays(gl.TRIANGLES, 0, T.length); gl.bindVertexArray(null);
+      gl.disable(gl.DEPTH_TEST);
+      return F;
+    };
+    const useOcc = (opts.occlusion ?? 1) > 0;
+    let WM = null;
+    if (useOcc && opts.mirror) { // bản lấy hoàn toàn từ nửa mặt đối xứng: dùng để vá chỗ tóc che trên mặt nguồn
+      const dm = data.slice(); const V = this.srcVis;
+      for (let k = 0; k < T.length; k++) { const o = k * 9, i = T[k]; dm[o+7] = 1; dm[o+8] = smooth(0.04, 0.3, V[MIRROR[i]]); }
+      WM = drawWarp('warpm', dm);
+    }
+    const W = drawWarp('warp', data);
 
     // 2) cắt ảnh đích
     const Dc = this._fbo('dcrop', pw, ph);
@@ -370,16 +469,18 @@ export class FaceSwapper {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, mcan);
     const Mz = this._fbo('mz', mw, mh);
     gl.bindTexture(gl.TEXTURE_2D, Mz.tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, this.mZ);
+    const Mt = this._fbo('mt', mw, mh);
+    gl.bindTexture(gl.TEXTURE_2D, Mt.tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, this.mT);
     const featherSigma = (opts.blend === 'multiband' ? 0.018 : 0.035) * opts.feather * faceP / 2; // theo px của mask
     const Mf = this._blur(Mraw, 'mt', 'mf', mw, mh, Math.max(0.5, featherSigma));
 
     // 4) thống kê LAB bền vững của da (nguồn thô / đích) – cache theo khung cho video
     const need = !this.stats || !opts.statsEvery || (this.frame % opts.statsEvery === 0);
     const S1 = this._fbo('s1', 64, 64), S2 = this._fbo('s2', 64, 64);
-    const ema = (old, nw) => (old && opts.statsEvery && nw) ? { mean: old.mean.map((v, i) => v * 0.5 + nw.mean[i] * 0.5), std: old.std.map((v, i) => v * 0.5 + nw.std[i] * 0.5) } : (nw || old);
+    const ema = (old, nw) => (old && opts.statsEvery && nw) ? { mean: old.mean.map((v, i) => v * 0.5 + nw.mean[i] * 0.5), std: old.std.map((v, i) => v * 0.5 + nw.std[i] * 0.5), slope: (old.slope || nw.slope || [0, 0, 0]).map((v, i) => v * 0.5 + (nw.slope || old.slope || [0, 0, 0])[i] * 0.5) } : (nw || old);
     if (need) {
-      this._pass('statsPack', S1, { u_useA: 1, u_ch: 1 }, { u_t: W.tex, u_m: Mf.tex });
-      this._pass('statsPack', S2, { u_useA: 0, u_ch: 2 }, { u_t: Dc.tex, u_m: Mf.tex });
+      this._pass('statsPack', S1, { u_useA: 1, u_ch: 1 }, { u_t: W.tex, u_m: Mz.tex });
+      this._pass('statsPack', S2, { u_useA: 0, u_ch: 2 }, { u_t: Dc.tex, u_m: Mz.tex });
       const a = labStats(this._read(S1)), b = labStats(this._read(S2));
       if (a && b) this.stats = { raw: ema(this.stats?.raw, a), dst: ema(this.stats?.dst, b), rel: this.stats?.rel };
     }
@@ -388,33 +489,45 @@ export class FaceSwapper {
     const SU = { u_sm: st.raw.mean, u_ss: st.raw.std, u_dm: st.dst.mean, u_ds: st.dst.std };
 
     // 5) che khuất vùng trán (tóc mái…) → mặt nạ cuối
+    const Sp = this._fbo('sp', mw, mh);
+    this._pass('sprep', Sp, SU, { u_w: W.tex, u_m: Mraw.tex });
+    const Sl = this._blur(Sp, 'st1', 'sl', mw, mh, Math.max(1, 0.05 * faceP / 2));
+    let SlM = Sl;
+    if (WM) { const Spm = this._fbo('spm', mw, mh); this._pass('sprep', Spm, SU, { u_w: WM.tex, u_m: Mraw.tex }); SlM = this._blur(Spm, 'st2', 'slm', mw, mh, Math.max(1, 0.05 * faceP / 2)); }
     const Oc = this._fbo('occ', mw, mh);
-    this._pass('occ', Oc, { ...SU, u_ec: this._zone.ec, u_up: this._zone.up }, { u_w: W.tex, u_d: Dc.tex, u_z: Mz.tex });
+    this._pass('occ', Oc, { ...SU, u_ec: this._zone.ec, u_up: this._zone.up }, { u_w: W.tex, u_d: Dc.tex, u_z: Mz.tex, u_sl: Sl.tex, u_wm: (WM || W).tex, u_slm: SlM.tex });
     const Ob = this._blur(Oc, 'ot', 'ob', mw, mh, Math.max(0.5, 0.012 * faceP / 2));
     const Mc = this._fbo('mc', mw, mh);
-    this._pass('mcomb', Mc, { u_amt: opts.occlusion ?? 1 }, { u_m: Mf.tex, u_o: Ob.tex });
+    const Ob2 = this._blur(Oc, 'ot2', 'ob2', mw, mh, Math.max(0.5, 0.04 * faceP / 2));
+    this._pass('mcomb', Mc, { u_amt: opts.occlusion ?? 1, u_big: 0 }, { u_m: Mf.tex, u_o: Ob.tex, u_o2: Ob2.tex });
 
     // 6) ánh sáng tần số thấp: tỉ lệ độ sáng đã làm mờ, chuẩn hoá theo vùng da của mỗi ảnh
     let cur = W;
+    if (useOcc) {
+      const Wi = this._fbo('wi', pw, ph);
+      this._pass('inpaint', Wi, { u_hasM: WM ? 1 : 0 }, { u_w: W.tex, u_s: Sl.tex, u_o: Ob.tex, u_wm: (WM || W).tex, u_sm2: SlM.tex });
+      cur = Wi;
+    }
     if (opts.relight > 0) {
       const iw = Math.max(8, Math.round(pw / 4)), ih = Math.max(8, Math.round(ph / 4));
       const Ip = this._fbo('ip', iw, ih);
-      this._pass('illumPrep', Ip, SU, { u_d: Dc.tex, u_w: W.tex, u_m: Mc.tex });
-      const Ib = this._blur(Ip, 'it', 'ib', iw, ih, Math.max(1, 0.06 * faceP / 4));
+      this._pass('illumPrep', Ip, SU, { u_d: Dc.tex, u_w: cur.tex, u_m: Mc.tex });
+      const Ib = this._blur(Ip, 'it', 'ib', iw, ih, Math.max(1, (opts.relightScale ?? 0.08) * faceP / 4));
       const R1 = this._fbo('relit', pw, ph);
-      const Y = L => ((L + 16) / 116) ** (3 / 2.2); // ~ luma sRGB
-      this._pass('relight', R1, { u_strength: opts.relight, u_g: Math.min(3, Math.max(0.33, Y(st.dst.mean[0]) / Y(st.raw.mean[0]))) }, { u_w: W.tex, u_i: Ib.tex });
+      const slp = x => (x && x.slope) ? [x.slope[1], x.slope[2]] : [0, 0];
+      this._pass('relight', R1, { u_strength: opts.relight, u_sm: st.raw.mean, u_dm: st.dst.mean, u_ks: slp(st.raw), u_kt: slp(st.dst), u_lim: opts.relightLim ?? 30 }, { u_w: cur.tex, u_i: Ib.tex });
       cur = R1;
     }
 
     // 7) khớp màu LAB (trung bình/độ lệch chuẩn) chỉ trên vùng da (đã loại mắt, mày, môi, tóc)
     if (opts.color > 0) {
       if (need || !st.rel) {
-        this._pass('statsPack', S1, { u_useA: 1, u_ch: 1 }, { u_t: cur.tex, u_m: Mc.tex });
+        this._pass('statsPack', S1, { u_useA: 1, u_ch: 1 }, { u_t: cur.tex, u_m: Mz.tex });
         st.rel = ema(st.rel, labStats(this._read(S1))) || st.raw;
       }
       const C = this._fbo('lab', pw, ph);
-      this._pass('labXfer', C, { u_ms: st.rel.mean, u_ss: st.rel.std, u_mt: st.dst.mean, u_st: st.dst.std, u_amt: opts.color }, { u_w: cur.tex });
+      const sl = x => (x && x.slope) ? [x.slope[1], x.slope[2]] : [0, 0];
+      this._pass('labXfer', C, { u_ms: st.rel.mean, u_ss: st.rel.std, u_mt: st.dst.mean, u_st: st.dst.std, u_amt: opts.color, u_ks: [0, 0], u_kt: [0, 0] }, { u_w: cur.tex });
       cur = C;
     }
 
@@ -429,7 +542,7 @@ export class FaceSwapper {
       ({ sharp, noise } = this.grainP);
     }
     const A = this._fbo('A', pw, ph);
-    this._pass('finalA', A, { u_px: [1 / pw, 1 / ph], u_sharp: sharp, u_noise: noise, u_seed: opts.statsEvery ? 0.37 : (this.frame % 97) * 0.013 }, { u_c: cur.tex, u_d: Dc.tex });
+    this._pass('finalA', A, { u_px: [1 / pw, 1 / ph], u_sharp: sharp, u_noise: noise, u_seed: opts.statsEvery ? 0.37 : (this.frame % 97) * 0.013, u_fill: useOcc ? (opts.occlusion ?? 1) : 0 }, { u_c: cur.tex, u_d: Dc.tex, u_o: Ob.tex, u_o2: Ob2.tex, u_mz: Mt.tex });
 
     // 9) trộn: đa băng tần (Laplacian pyramid) hoặc viền mềm
     let Rres;
@@ -450,7 +563,8 @@ export class FaceSwapper {
         this._pass('collapse', f, { u_top: 0 }, { u_a0: GA[l].tex, u_a1: GA[l+1].tex, u_b0: GB[l].tex, u_b1: GB[l+1].tex, u_m: GM[l].tex, u_r1: Rn.tex });
         Rn = f;
       }
-      Rres = Rn;
+      Rres = this._fbo('rcore', pw, ph);
+      this._pass('core', Rres, {}, { u_r: Rn.tex, u_a: A.tex, u_m: Mc.tex });
     } else {
       Rres = this._fbo('rf', pw, ph);
       this._pass('feather', Rres, {}, { u_a: A.tex, u_d: Dc.tex, u_m: Mc.tex });
@@ -459,7 +573,7 @@ export class FaceSwapper {
     // 10) xuất toàn khung
     this._pass('output', null, { u_has: 1, u_crop: [crop.x / dw, crop.y / dh, crop.w / dw, crop.h / dh] }, { u_d: this.dstTex, u_r: Rres.tex }, 1);
     if (opts.debug && this.fbos.get(opts.debug)) { const f = this.fbos.get(opts.debug); this.canvas.width = f.w; this.canvas.height = f.h; this._pass('copy', null, {}, { u_t: f.tex }, 1); }
-    return { crop, pts, sharp, noise, stats: this.stats };
+    return { crop, pts, sharp, noise, stats: this.stats, yawSrc: this.srcYaw, yawDst: yawOf(dlm) };
   }
 }
 

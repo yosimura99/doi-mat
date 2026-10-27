@@ -1,6 +1,6 @@
 // Service worker Đổi Mặt: network-first (luôn lấy bản mới khi có mạng), rơi về cache khi offline.
 // Ngoài giao diện, còn lưu wasm MediaPipe + mô hình sau lần dùng đầu để chạy offline.
-const VERSION = 'doi-mat-v1';
+const VERSION = 'doi-mat-v2';
 const SHELL = ['./', 'index.html', 'css/app.css', 'js/app.js', 'js/landmarks.js', 'js/faceswap.js', 'js/geometry.js', 'js/canonical.js',
   'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 const CACHEABLE = u => u.origin === self.location.origin || u.hostname === 'cdn.jsdelivr.net' || u.hostname === 'storage.googleapis.com';

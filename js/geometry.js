@@ -147,6 +147,12 @@ export function mirrorWeights(vis) {
   return w;
 }
 
+/** Góc quay ngang (độ) ước lượng từ lưới 3D: dương = quay sang phải ảnh */
+export function yawOf(lm) {
+  const a = lm[234], b = lm[454];
+  return Math.atan2(b.z - a.z, b.x - a.x) * 180 / Math.PI;
+}
+
 export { MIRROR };
 
 export function bbox(lm, idx) {
