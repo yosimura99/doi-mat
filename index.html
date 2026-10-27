@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Đổi Mặt</title>
+<meta name="description" content="Đổi khuôn mặt giữa hai ảnh hoặc trực tiếp qua camera – chạy hoàn toàn trên máy, không tải ảnh lên.">
+<meta name="theme-color" content="#0b0d12">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Đổi Mặt">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="icon" type="image/svg+xml" href="icons/icon.svg">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand"><img src="icons/icon.svg" alt="" width="30" height="30"><h1>Đổi Mặt</h1></div>
+    <span class="fun">Chỉ dùng cho vui</span>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" class="tab on" data-tab="photo" aria-selected="true">Ảnh</button>
+    <button role="tab" class="tab" data-tab="live" aria-selected="false">Camera trực tiếp</button>
+  </nav>
+
+  <!-- CHẾ ĐỘ ẢNH -->
+  <section id="tab-photo" class="panel">
+    <div class="pick">
+      <div class="slot" id="slotA">
+        <div class="slot-title"><b>1</b> Mặt nguồn</div>
+        <div class="slot-body">
+          <canvas class="thumb" hidden></canvas>
+          <div class="empty"><span class="plus">＋</span><span>Chọn ảnh có khuôn mặt muốn dùng</span></div>
+          <div class="badge" hidden></div>
+        </div>
+        <div class="slot-actions">
+          <label class="mini">Thư viện<input type="file" accept="image/*" data-src="lib" hidden></label>
+          <label class="mini">Chụp<input type="file" accept="image/*" capture="user" data-src="cam" hidden></label>
+        </div>
+      </div>
+      <button class="swapdir" id="flip" title="Đảo hai ảnh" aria-label="Đảo hai ảnh">⇄</button>
+      <div class="slot" id="slotB">
+        <div class="slot-title"><b>2</b> Ảnh đích</div>
+        <div class="slot-body">
+          <canvas class="thumb" hidden></canvas>
+          <div class="empty"><span class="plus">＋</span><span>Chọn ảnh sẽ được thay mặt</span></div>
+          <div class="badge" hidden></div>
+        </div>
+        <div class="slot-actions">
+          <label class="mini">Thư viện<input type="file" accept="image/*" data-src="lib" hidden></label>
+          <label class="mini">Chụp<input type="file" accept="image/*" capture="environment" data-src="cam" hidden></label>
+        </div>
+      </div>
+    </div>
+    <p class="consent">Chỉ dùng ảnh của bạn hoặc người đã đồng ý. Không dùng để giả mạo, lừa đảo hay làm nội dung người lớn.</p>
+    <p class="hint" id="pickHint">Ứng dụng tự chọn khuôn mặt lớn nhất. Ảnh có nhiều người? Chạm vào khuôn mặt bạn muốn.</p>
+
+    <label class="check"><input type="checkbox" id="both"> Đổi cả hai chiều (thêm ảnh 1 mang mặt ảnh 2)</label>
+
+    <details class="adv" id="adv">
+      <summary>Nâng cao</summary>
+      <p class="hint">Mặc định mọi thứ tự động. Chỉ chỉnh nếu muốn thử.</p>
+      <label class="row">Giữ nét mặt nguồn<input type="range" id="o-identity" min="0" max="1" step="0.05" value="0.55"></label>
+      <label class="row">Khớp ánh sáng<input type="range" id="o-relight" min="0" max="1" step="0.05" value="1"></label>
+      <label class="row">Khớp màu da<input type="range" id="o-color" min="0" max="1" step="0.05" value="1"></label>
+      <label class="row">Độ mềm viền<input type="range" id="o-feather" min="0.4" max="2.5" step="0.1" value="1"></label>
+      <label class="row">Kiểu trộn
+        <select id="o-blend"><option value="multiband">Đa tần (đẹp nhất)</option><option value="feather">Làm mềm viền (nhanh)</option></select></label>
+      <label class="check"><input type="checkbox" id="o-keepMouth" checked> Giữ miệng/răng ảnh đích khi đang há</label>
+      <label class="check"><input type="checkbox" id="o-keepEyes" checked> Giữ mắt ảnh đích khi đang nhắm</label>
+      <label class="check"><input type="checkbox" id="o-occlusion" checked> Giữ tóc mái/vật che mặt của ảnh đích</label>
+      <button class="ghost" id="o-reset" type="button">Về tự động</button>
+    </details>
+
+    <button class="cta" id="go" disabled>Đổi mặt</button>
+    <p class="status" id="status" aria-live="polite"></p>
+
+    <div class="result" id="result" hidden>
+      <div class="rtabs" id="rtabs" hidden>
+        <button class="rtab on" data-i="0">Ảnh 2 mang mặt 1</button>
+        <button class="rtab" data-i="1">Ảnh 1 mang mặt 2</button>
+      </div>
+      <div class="compare" id="compare">
+        <canvas id="after"></canvas>
+        <div class="before-wrap" id="beforeWrap"><canvas id="before"></canvas></div>
+        <div class="handle" id="handle"><span></span></div>
+        <span class="lbl l">Trước</span><span class="lbl r">Sau</span>
+      </div>
+      <input type="range" id="slider" min="0" max="100" value="50" aria-label="Kéo để so sánh trước/sau">
+      <div class="actions">
+        <button class="cta" id="save">Lưu ảnh</button>
+      </div>
+      <p class="hint">Trên iPhone: nhấn “Lưu ảnh” rồi chọn “Lưu hình ảnh”. Nếu không thấy, nhấn giữ vào ảnh để lưu.</p>
+    </div>
+  </section>
+
+  <!-- CHẾ ĐỘ CAMERA -->
+  <section id="tab-live" class="panel" hidden>
+    <div class="live-src">
+      <canvas id="liveThumb" class="lthumb" hidden></canvas>
+      <div class="live-src-text">
+        <b>Mặt nguồn</b>
+        <span id="liveSrcInfo">Chọn ảnh khuôn mặt sẽ “đeo” lên camera.</span>
+        <div class="slot-actions">
+          <label class="mini">Thư viện<input type="file" id="liveFile" accept="image/*" hidden></label>
+          <button class="mini" id="liveUseA" hidden>Dùng ảnh 1</button>
+        </div>
+      </div>
+    </div>
+    <p class="consent">Chỉ dùng ảnh của bạn hoặc người đã đồng ý. Không dùng để giả mạo, lừa đảo hay làm nội dung người lớn.</p>
+    <div class="stage" id="stage">
+      <video id="video" playsinline muted autoplay></video>
+      <canvas id="liveOut"></canvas>
+      <div class="stage-empty" id="stageEmpty">Camera đang tắt</div>
+      <span class="fps" id="fps" hidden></span>
+    </div>
+    <div class="actions">
+      <button class="cta" id="camBtn">Bật camera</button>
+      <button class="round" id="shot" disabled aria-label="Chụp">●</button>
+      <button class="ghost" id="camFlip" disabled>Đổi camera</button>
+    </div>
+    <p class="status" id="liveStatus" aria-live="polite"></p>
+  </section>
+
+  <footer class="foot">Ảnh được xử lý ngay trên máy của bạn, không tải lên đâu cả. <span id="offline"></span></footer>
+</div>
+
+<div class="sheet" id="sheet" hidden>
+  <div class="sheet-card">
+    <p>Nhấn giữ vào ảnh rồi chọn <b>“Lưu vào Ảnh”</b>.</p>
+    <img id="sheetImg" alt="Ảnh đã đổi mặt">
+    <div class="actions"><a class="ghost" id="sheetDl" download="doi-mat.png">Tải xuống</a><button class="cta" id="sheetClose">Xong</button></div>
+  </div>
+</div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
